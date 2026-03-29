@@ -38,12 +38,12 @@ struct ltmouse_dev {
     struct input_dev    *input;
     struct urb          *urb;
 
-    /* DMA-coherent buffer for URB */
     unsigned char       *data;
-    dma_addr_t           data_dma;
 
     int                  pipe;
     int                  interval;
+    int                  pktsize;   /* actual URB transfer length (= maxp) */
+    bool                 closing;   /* set before usb_kill_urb to suppress resubmit */
 
     char                 phys[64];
 };
@@ -59,29 +59,40 @@ static void ltmouse_irq(struct urb *urb)
     struct input_dev *dev = mouse->input;
     int status;
 
+    pr_info(DRIVER_NAME ": irq called status=%d actual_len=%d\n",
+            urb->status, urb->actual_length);
+
     switch (urb->status) {
-    case 0:             /* success */
+    case 0:             /* success — data in buffer */
         break;
-    case -ECONNRESET:
     case -ENOENT:
+        /* VMware's virtual HCD completes the URB with -ENOENT when
+         * there is no pending mouse data (~125 ms timeout), rather
+         * than keeping the URB queued like real hardware does.
+         * Resubmit so we keep polling, unless we are closing. */
+        if (mouse->closing)
+            return;
+        goto resubmit;
+    case -ECONNRESET:
     case -ESHUTDOWN:
-        /* driver is being unloaded, stop resubmitting */
+        /* device gone or driver unloading — stop */
         return;
     default:
         pr_err(DRIVER_NAME ": urb error: %d\n", urb->status);
         goto resubmit;
     }
 
-    /* parse HID Boot Mouse 3-byte report */
-    pr_info(DRIVER_NAME ": btn=%02x X=%d Y=%d\n",
-            data[0], (signed char)data[1], (signed char)data[2]);
+    /* Log raw bytes to see whatever format the device actually sends */
+    pr_info(DRIVER_NAME ": len=%d data=%02x %02x %02x %02x %02x %02x %02x %02x\n",
+            urb->actual_length,
+            data[0], data[1], data[2], data[3],
+            data[4], data[5], data[6], data[7]);
 
-    /* buttons */
+    /* Try both Boot Protocol (data[0]=buttons) and Report Protocol
+     * (data[0]=report_id, data[1]=buttons). Log helps identify which. */
     input_report_key(dev, BTN_LEFT,   data[0] & 0x01);
     input_report_key(dev, BTN_RIGHT,  data[0] & 0x02);
     input_report_key(dev, BTN_MIDDLE, data[0] & 0x04);
-
-    /* relative movement */
     input_report_rel(dev, REL_X, (signed char)data[1]);
     input_report_rel(dev, REL_Y, (signed char)data[2]);
 
@@ -91,6 +102,40 @@ resubmit:
     status = usb_submit_urb(urb, GFP_ATOMIC);
     if (status)
         pr_err(DRIVER_NAME ": failed to resubmit urb: %d\n", status);
+}
+
+/* ------------------------------------------------------------------ */
+/* input open/close — start/stop the URB when a reader appears         */
+/* ------------------------------------------------------------------ */
+
+static int ltmouse_open(struct input_dev *dev)
+{
+    struct ltmouse_dev *mouse = input_get_drvdata(dev);
+
+    int err;
+
+    mouse->closing = false;
+    mouse->urb->dev = mouse->udev;
+    err = usb_submit_urb(mouse->urb, GFP_KERNEL);
+    if (err) {
+        pr_err(DRIVER_NAME ": usb_submit_urb failed on open: %d\n", err);
+        return -EIO;
+    }
+    pr_info(DRIVER_NAME ": input opened, urb submitted\n");
+    return 0;
+}
+
+static void ltmouse_close(struct input_dev *dev)
+{
+    struct ltmouse_dev *mouse = input_get_drvdata(dev);
+
+    mouse->closing = true;
+    usb_kill_urb(mouse->urb);
+    /* Do NOT reset closing here — usb_kill_urb synchronously drains any
+     * in-flight completion, but a -ENOENT resubmit that raced in just
+     * before kill could fire again immediately after.  Leaving closing=true
+     * suppresses that stray completion.  ltmouse_open resets it on reuse. */
+    pr_info(DRIVER_NAME ": input closed, urb killed\n");
 }
 
 /* ------------------------------------------------------------------ */
@@ -124,6 +169,16 @@ static int ltmouse_probe(struct usb_interface *intf,
         return -ENODEV;
     }
 
+    /* Re-enable endpoints disabled when the previous driver (e.g. usbhid)
+     * unbound.  usb_unbind_interface() may call usb_disable_interface(),
+     * which zeroes dev->ep_in[], causing usb_pipe_endpoint() → NULL →
+     * usb_submit_urb() → -ENODEV.  Calling usb_set_interface() here
+     * re-enables all endpoints for this alt setting before we use them. */
+    ret = usb_set_interface(udev, iface_desc->desc.bInterfaceNumber,
+                            iface_desc->desc.bAlternateSetting);
+    if (ret)
+        pr_warn(DRIVER_NAME ": usb_set_interface failed: %d (continuing)\n", ret);
+
     mouse = kzalloc(sizeof(*mouse), GFP_KERNEL);
     if (!mouse)
         return -ENOMEM;
@@ -142,10 +197,14 @@ static int ltmouse_probe(struct usb_interface *intf,
     maxp     = usb_maxpacket(udev, pipe, usb_pipeout(pipe));
     mouse->pipe     = pipe;
     mouse->interval = endpoint->bInterval;
+    /* Use full maxp so the HCD never sees a short-transfer overflow.
+     * Boot Mouse only uses bytes 0-2 but the device may send up to maxp. */
+    mouse->pktsize  = maxp;
 
-    /* allocate DMA-coherent data buffer */
-    mouse->data = usb_alloc_coherent(udev, MOUSE_REPORT_SIZE,
-                                     GFP_KERNEL, &mouse->data_dma);
+    /* plain kmalloc — let the USB core handle DMA mapping.
+     * usb_alloc_coherent + URB_NO_TRANSFER_DMA_MAP can silently
+     * break on VMware's emulated host controller. */
+    mouse->data = kmalloc(mouse->pktsize, GFP_KERNEL);
     if (!mouse->data) {
         ret = -ENOMEM;
         goto err_free_input;
@@ -167,6 +226,9 @@ static int ltmouse_probe(struct usb_interface *intf,
     input_dev->phys       = mouse->phys;
     usb_to_input_id(udev, &input_dev->id);
     input_dev->dev.parent = &intf->dev;
+    input_set_drvdata(input_dev, mouse);
+    input_dev->open  = ltmouse_open;
+    input_dev->close = ltmouse_close;
 
     /* declare capabilities */
     input_dev->evbit[0] = BIT_MASK(EV_KEY) | BIT_MASK(EV_REL);
@@ -174,12 +236,14 @@ static int ltmouse_probe(struct usb_interface *intf,
         BIT_MASK(BTN_LEFT) | BIT_MASK(BTN_RIGHT) | BIT_MASK(BTN_MIDDLE);
     input_dev->relbit[0] = BIT_MASK(REL_X) | BIT_MASK(REL_Y);
 
-    /* fill URB */
+    /* fill URB — use endpoint's bInterval and full maxp size.
+     * Low-speed USB requires interval >= 8ms; hardcoding 1 causes
+     * -EINVAL from UHCI.  Do NOT send SET_PROTOCOL: VMware's virtual
+     * HID device stops sending data if the guest switches to Boot
+     * Protocol; leave it in Report Protocol and accept any report. */
     usb_fill_int_urb(mouse->urb, udev, pipe,
-                     mouse->data, min(maxp, MOUSE_REPORT_SIZE),
-                     ltmouse_irq, mouse, endpoint->bInterval);
-    mouse->urb->transfer_dma    = mouse->data_dma;
-    mouse->urb->transfer_flags |= URB_NO_TRANSFER_DMA_MAP;
+                     mouse->data, mouse->pktsize,
+                     ltmouse_irq, mouse, mouse->interval);
 
     ret = input_register_device(input_dev);
     if (ret)
@@ -187,22 +251,14 @@ static int ltmouse_probe(struct usb_interface *intf,
 
     usb_set_intfdata(intf, mouse);
 
-    ret = usb_submit_urb(mouse->urb, GFP_KERNEL);
-    if (ret) {
-        pr_err(DRIVER_NAME ": usb_submit_urb failed: %d\n", ret);
-        goto err_unregister;
-    }
-
+    /* URB is submitted via ltmouse_open() when a reader opens the device */
     pr_info(DRIVER_NAME ": USB mouse connected (%s)\n", mouse->phys);
     return 0;
 
-err_unregister:
-    input_unregister_device(input_dev);
-    input_dev = NULL;   /* avoid double-free: input_unregister frees it */
 err_free_urb:
     usb_free_urb(mouse->urb);
 err_free_buf:
-    usb_free_coherent(udev, MOUSE_REPORT_SIZE, mouse->data, mouse->data_dma);
+    kfree(mouse->data);
 err_free_input:
     if (input_dev)
         input_free_device(input_dev);
@@ -219,11 +275,11 @@ static void ltmouse_disconnect(struct usb_interface *intf)
     if (!mouse)
         return;
 
+    mouse->closing = true;
     usb_kill_urb(mouse->urb);
     input_unregister_device(mouse->input);
     usb_free_urb(mouse->urb);
-    usb_free_coherent(mouse->udev, MOUSE_REPORT_SIZE,
-                      mouse->data, mouse->data_dma);
+    kfree(mouse->data);
     kfree(mouse);
 
     pr_info(DRIVER_NAME ": USB mouse disconnected\n");
